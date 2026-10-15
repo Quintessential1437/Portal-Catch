@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Portal Catch AR</title>
+<style>
+:root{--bg:#070b14;--fg:#eaf2ff;--o:#ff9a1f;--b:#2bb6ff;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#070b14;--fg:#eaf2ff}}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;overflow:hidden;-webkit-user-select:none;user-select:none}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.panel{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:24px;background:rgba(5,8,16,.88)}
+.panel h1{margin:0;font-size:28px}
+.panel p{margin:0;max-width:330px;opacity:.88;font-size:15px;line-height:1.45}
+.o{color:var(--o);font-weight:700}.b{color:var(--b);font-weight:700}
+button{background:linear-gradient(90deg,var(--o),var(--b));color:#06101c;border:0;border-radius:999px;padding:14px 26px;font-size:16px;font-weight:800}
+button.ghost{background:transparent;color:var(--fg);border:1px solid #ffffff44}
+#hud{position:absolute;left:0;right:0;bottom:calc(14px + env(safe-area-inset-bottom,0px));text-align:center;font-size:13px;opacity:.92;pointer-events:none;text-shadow:0 1px 4px #000}
+#tag{position:absolute;top:calc(8px + env(safe-area-inset-top,0px));left:10px;font-size:12px;background:#0008;color:#fff;padding:4px 8px;border-radius:8px;display:none}
+#over{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tag"></div>
+<div id="hud"></div>
+<div id="menu" class="panel">
+  <h1>🌀 Portal Catch</h1>
+  <p>Pinch the ball, fling it into the <span class="o">orange portal</span>, and it blasts out of the <span class="b">blue portal</span> straight at you. <b>Catch it with your hand</b> or you lose. It gets faster every round.</p>
+  <button id="go">Play with camera</button>
+  <button id="touch" class="ghost">Play with touch (no camera)</button>
+</div>
+<div id="over" class="panel">
+  <h1>Missed it! 💥</h1>
+  <p id="overTxt"></p>
+  <button id="again">Play again</button>
+</div>
+<video id="v" playsinline muted style="display:none"></video>
+
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),vid=document.getElementById('v');
+const menu=document.getElementById('menu'),over=document.getElementById('over'),hud=document.getElementById('hud'),tagEl=document.getElementById('tag');
+let W=0,H=0,dpr=Math.min(devicePixelRatio||1,2);
+function resize(){W=innerWidth;H=innerHeight;cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0)}
+addEventListener('resize',resize);resize();
+
+// ---------- helpers ----------
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const rnd=(a=0,b=1)=>a+Math.random()*(b-a);
+let ac=null;
+function initAudio(){try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();if(ac.state==='suspended')ac.resume()}catch(e){}}
+function tone(f0,f1,dur,type='sine',vol=0.14){
+  if(!ac)return;try{const t=ac.currentTime,o=ac.createOscillator(),g=ac.createGain();
+  o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);
+  g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.001,t+dur);o.connect(g);g.connect(ac.destination);o.start(t);o.stop(t+dur)}catch(e){}
+}
+let best=0;try{best=+localStorage.getItem('portalBest')||0}catch(e){}
+
+// ---------- portals ----------
+const SLOTS=[[.13,.40,'v'],[.87,.40,'v'],[.32,.16,'h'],[.68,.16,'h'],[.13,.62,'v'],[.87,.62,'v']];
+function slotPos(k){
+  const s=SLOTS[k],R=Math.max(48,Math.min(W,H)*0.15);
+  return{x:s[0]*W,y:s[1]*H,rx:s[2]==='v'?R*.55:R,ry:s[2]==='v'?R:R*.55,k};
+}
+let P1=slotPos(0),P2=slotPos(1),i1=0,i2=1;
+function shuffle(){
+  let a,b,tries=0;
+  do{a=Math.floor(Math.random()*6);b=Math.floor(Math.random()*6);tries++}
+  while((a===b||Math.hypot(SLOTS[a][0]-SLOTS[b][0],SLOTS[a][1]-SLOTS[b][1])<0.3)&&tries<30);
+  i1=a;i2=b;P1=slotPos(a);P2=slotPos(b);
+}
+
+// ---------- game state ----------
+const G={state:'menu',score:0,t0:0,flash:0,msg:'',msgT:0,glow1:0,glow2:0};
+const ball={x:0,y:0,vx:0,vy:0,r:20};
+let hist=[],trail=[],parts=[],inc=null,mode='none',fit=null,last=performance.now();
+const baseR=()=>Math.max(20,Math.min(W,H)*0.06);
+const say=(t,ms=1400)=>{G.msg=t;G.msgT=performance.now()+ms};
+
+function resetGame(){
+  G.score=0;G.state='ready';G.flash=0;i1=0;i2=1;P1=slotPos(0);P2=slotPos(1);
+  trail=[];parts=[];hist=[];over.style.display='none';
+  say('Pinch the ball and fling it into the orange portal',2600);
+}
+function burst(x,y,col,n=26,sp=380){for(let i=0;i<n;i++){const a=Math.random()*6.283,v=rnd(.3,1)*sp;parts.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,l:1,col})}}
+
+// ---------- hands ----------
+let mpHands=[],mpTime=0,ptr=null;const pinchFlag=[];
+function getHands(now){
+  if(mode==='touch')return ptr&&ptr.down?[{palm:ptr,pp:ptr,hs:70,pinch:true,tips:[ptr]}]:[];
+  if(now-mpTime>250){pinchFlag.length=0;return[]}
+  return mpHands.map((L,i)=>{
+    const avg=ids=>({x:ids.reduce((s,k)=>s+L[k].x,0)/ids.length,y:ids.reduce((s,k)=>s+L[k].y,0)/ids.length});
+    const palm=avg([0,5,9,13,17]),pp=avg([4,8]),hs=Math.max(30,dist(L[0],L[9])),ratio=dist(L[4],L[8])/hs;
+    if(pinchFlag[i]===undefined)pinchFlag[i]=false;
+    if(!pinchFlag[i]&&ratio<0.32)pinchFlag[i]=true;else if(pinchFlag[i]&&ratio>0.55)pinchFlag[i]=false;
+    return{palm,pp,hs,pinch:pinchFlag[i],tips:[L[8],L[12],L[16],L[4],L[20]],L};
+  });
+}
+
+// ---------- game logic ----------
+function release(now){
+  let vx=0,vy=0;
+  const n=hist[hist.length-1];
+  if(n){const o=hist.find(h=>n.t-h.t<=130);const dt=o?(n.t-o.t)/1000:0;
+    if(dt>0.02){vx=(n.x-o.x)/dt*1.5;vy=(n.y-o.y)/dt*1.5}}
+  const sp=Math.hypot(vx,vy),mx=3400;if(sp>mx){vx*=mx/sp;vy*=mx/sp}
+  ball.vx=vx;ball.vy=vy;G.state='flying';trail=[];tone(300,700,.12,'triangle');
+}
+function enterPortal(now){
+  G.state='tunnel';G.t0=now;G.glow1=1;burst(P1.x,P1.y,'#ff9a1f',22,300);tone(700,120,.35,'sawtooth',.12);
+  inc={tx:W*rnd(.22,.78),ty:H*rnd(.5,.82),curve:rnd(-.3,.3)*W,T:Math.max(.45,1.0-0.055*G.score),start:0};
+}
+function lose(now){
+  G.state='over';G.flash=1;burst(ball.x,ball.y,'#ff4040',40,520);tone(400,60,.6,'sawtooth',.2);
+  try{navigator.vibrate&&navigator.vibrate(200)}catch(e){}
+  if(G.score>best){best=G.score;try{localStorage.setItem('portalBest',best)}catch(e){}}
+  setTimeout(()=>{document.getElementById('overTxt').textContent='You caught '+G.score+' in a row. Best: '+best+'.';over.style.display='flex'},800);
+}
+function caught(now){
+  G.score++;G.state='caught';G.t0=now;G.glow2=1;burst(ball.x,ball.y,'#7dff9b',34,420);tone(600,1200,.15,'triangle',.18);setTimeout(()=>tone(900,1500,.2,'triangle',.15),110);
+  shuffle();say(G.score>1?'Caught! ×'+G.score:'Caught!',1000);
+}
+
+function update(now,dt,hs){
+  const r0=baseR(),S=G.state;
+  G.glow1=Math.max(0,G.glow1-dt*1.6);G.glow2=Math.max(0,G.glow2-dt*1.6);G.flash=Math.max(0,G.flash-dt*1.2);
+  if(S==='ready'){
+    ball.x=W/2;ball.y=H*0.8+Math.sin(now*0.004)*5;ball.r=r0;ball.vx=ball.vy=0;
+    for(const h of hs)if(h.pinch&&dist(h.pp,ball)<ball.r*2.4+h.hs*0.25){G.state='held';hist=[];trail=[];tone(500,800,.08);break}
+  }else if(S==='held'){
+    let bh=null,bd=1e9;for(const h of hs)if(h.pinch){const d=dist(h.pp,ball);if(d<bd){bd=d;bh=h}}
+    if(bh&&bd<Math.max(170,bh.hs*1.6)){
+      ball.x+=(bh.pp.x-ball.x)*0.7;ball.y+=(bh.pp.y-ball.y)*0.7;
+      hist.push({t:now,x:ball.x,y:ball.y});while(hist.length&&now-hist[0].t>200)hist.shift();
+    }else release(now);
+  }else if(S==='flying'){
+    const g=1300*(H/800);
+    // aim assist: if you throw roughly toward the orange portal, the ball curves into it
+    const dx=P1.x-ball.x,dy=P1.y-ball.y,d=Math.hypot(dx,dy)||1,rng=Math.max(W,H)*0.9,sp=Math.hypot(ball.vx,ball.vy);
+    const cosA=sp>1?(ball.vx*dx+ball.vy*dy)/(sp*d):0;
+    let as=0;if(cosA>0.2&&sp>250)as=Math.min(1,(1-d/rng)*1.6)*Math.min(1,(cosA-0.2)/0.5);
+    ball.vy+=g*dt*(1-0.85*as);
+    if(as>0){const want=Math.max(sp,900),k=Math.min(1,dt*7*as);
+      let nx=ball.vx/sp*(1-k)+dx/d*k,ny=ball.vy/sp*(1-k)+dy/d*k;const nl=Math.hypot(nx,ny)||1;
+      const ns=sp+(want-sp)*Math.min(1,dt*5*as);ball.vx=nx/nl*ns;ball.vy=ny/nl*ns}
+    ball.x+=ball.vx*dt;ball.y+=ball.vy*dt;
+    trail.push({x:ball.x,y:ball.y});if(trail.length>12)trail.shift();
+    const ex=(ball.x-P1.x)/P1.rx,ey=(ball.y-P1.y)/P1.ry;
+    if(ex*ex+ey*ey<1.25)enterPortal(now);
+    else if(ball.y>H+120||ball.x<-120||ball.x>W+120||ball.y<-200){G.state='miss';G.t0=now;say('Missed the portal, try again',1100)}
+  }else if(S==='miss'){
+    if(now-G.t0>600){G.state='ready';trail=[]}
+  }else if(S==='tunnel'){
+    const t=(now-G.t0)/1000;
+    if(t>0.65){G.state='incoming';inc.start=now;G.glow2=1;tone(150,900,.25,'sawtooth',.18);burst(P2.x,P2.y,'#2bb6ff',24,380)}
+    else if(t>0.28)G.glow2=Math.max(G.glow2,0.5+0.5*Math.sin(t*40));
+  }else if(S==='incoming'){
+    const u=(now-inc.start)/1000/inc.T,e=Math.pow(Math.min(u,1.2),2);
+    ball.x=P2.x+(inc.tx-P2.x)*e+inc.curve*Math.sin(Math.PI*Math.min(u,1))*0.6;
+    ball.y=P2.y+(inc.ty-P2.y)*e;ball.r=r0*(0.25+2.1*e);
+    trail.push({x:ball.x,y:ball.y,r:ball.r*0.8});if(trail.length>10)trail.shift();
+    if(u>0.5){
+      for(const h of hs){
+        const pts=[h.palm,h.pp,...(h.tips||[])];
+        if(pts.some(p=>dist(p,ball)<ball.r+h.hs*0.3)){caught(now);return}
+      }
+    }
+    if(u>=1)lose(now);
+  }else if(S==='caught'){
+    const t=(now-G.t0)/700;
+    if(t>=1){G.state='ready';trail=[]}
+    else{ball.x+=(W/2-ball.x)*Math.min(1,dt*8);ball.y+=(H*0.8-ball.y)*Math.min(1,dt*8);ball.r+=(r0-ball.r)*Math.min(1,dt*8)}
+  }
+  for(const p of parts){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=500*dt;p.l-=dt*1.8}
+  parts=parts.filter(p=>p.l>0);
+}
+
+// ---------- drawing ----------
+function drawVideo(){
+  const vw=vid.videoWidth,vh=vid.videoHeight;if(!vw)return null;
+  const s=Math.max(W/vw,H/vh),dw=vw*s,dh=vh*s,ox=(W-dw)/2,oy=(H-dh)/2;
+  ctx.save();ctx.translate(W,0);ctx.scale(-1,1);ctx.drawImage(vid,ox,oy,dw,dh);ctx.restore();
+  return{s,dw,dh,ox,oy};
+}
+function wall(){
+  ctx.fillStyle='#10172a';ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#ffffff10';ctx.lineWidth=1;const bh=44,bw=88;
+  for(let y=0,r=0;y<H;y+=bh,r++){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();for(let x=(r%2)*bw/2;x<W;x+=bw){ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x,y+bh);ctx.stroke()}}
+}
+function portal(p,col,col2,time,glow,label){
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,.35)';ctx.beginPath();ctx.ellipse(p.x,p.y,p.rx*1.25,p.ry*1.2,0,0,6.283);ctx.fill();
+  ctx.shadowColor=col;ctx.shadowBlur=18+34*glow;
+  const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,Math.max(p.rx,p.ry));
+  g.addColorStop(0,'#000');g.addColorStop(.7,'#080a18');g.addColorStop(1,col2);
+  ctx.fillStyle=g;ctx.beginPath();ctx.ellipse(p.x,p.y,p.rx,p.ry,0,0,6.283);ctx.fill();
+  ctx.strokeStyle=col;ctx.lineWidth=6+7*glow;ctx.stroke();ctx.shadowBlur=0;
+  for(let k=0;k<3;k++){const s=0.82-k*0.2,a=time*0.003*(k%2?-1:1)*(1+k*.5);ctx.globalAlpha=.6;ctx.lineWidth=2.5;ctx.beginPath();ctx.ellipse(p.x,p.y,p.rx*s,p.ry*s,0,a,a+2.2);ctx.stroke()}
+  ctx.globalAlpha=1;ctx.fillStyle=col;ctx.font='800 12px system-ui';ctx.textAlign='center';ctx.fillText(label,p.x,p.y+p.ry+20);
+  ctx.restore();
+}
+function drawBall(x,y,r,col){
+  const g=ctx.createRadialGradient(x-r*.35,y-r*.35,r*.1,x,y,r);
+  g.addColorStop(0,'#fff');g.addColorStop(.5,col);g.addColorStop(1,'#1a1a28');
+  ctx.save();ctx.shadowColor=col;ctx.shadowBlur=r*1.1;ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,r,0,6.283);ctx.fill();ctx.restore();
+}
+function draw(now,hs){
+  const S=G.state;
+  portal(P1,'#ff9a1f','#7a3a00',now,G.glow1,'IN');
+  portal(P2,'#2bb6ff','#0a3a66',now,G.glow2,'OUT');
+  // landing marker while the ball is inside the tunnel / coming out
+  if((S==='tunnel'&&(now-G.t0)/1000>0.28)||S==='incoming'){
+    const pr=0.5+0.5*Math.sin(now*0.02),rr=baseR()*2.3;
+    ctx.strokeStyle=`rgba(255,255,255,${0.25+0.3*pr})`;ctx.lineWidth=3;ctx.setLineDash([8,8]);
+    ctx.beginPath();ctx.arc(inc.tx,inc.ty,rr,0,6.283);ctx.stroke();ctx.setLineDash([]);
+  }
+  const col=(S==='incoming'||S==='caught')?'#6fd0ff':'#ffd27a';
+  trail.forEach((t,i)=>{const a=i/trail.length;ctx.globalAlpha=a*0.35;ctx.fillStyle=col;ctx.beginPath();ctx.arc(t.x,t.y,(t.r||ball.r)*a*0.9,0,6.283);ctx.fill()});
+  ctx.globalAlpha=1;
+  if(S==='ready'){ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=2;ctx.beginPath();ctx.arc(ball.x,ball.y,ball.r*(2+0.2*Math.sin(now*0.006)),0,6.283);ctx.stroke()}
+  if(S==='ready'||S==='held'||S==='flying'||S==='incoming'||S==='caught')drawBall(ball.x,ball.y,ball.r,col);
+  if(S==='tunnel'){
+    const t=(now-G.t0)/1000;
+    if(t<0.28){const u=t/0.28,a=u*6;drawBall(ball.x+(P1.x-ball.x)*u+Math.cos(a)*ball.r*(1-u)*.6,ball.y+(P1.y-ball.y)*u+Math.sin(a)*ball.r*(1-u)*.6,Math.max(2,ball.r*(1-u)),col)}
+  }
+  for(const p of parts){ctx.globalAlpha=Math.max(0,p.l);ctx.fillStyle=p.col;ctx.beginPath();ctx.arc(p.x,p.y,3+4*p.l,0,6.283);ctx.fill()}
+  ctx.globalAlpha=1;
+  // hand markers
+  for(const h of hs){
+    ctx.strokeStyle=h.pinch?'#7dff9b':'rgba(255,255,255,.7)';ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(h.palm.x,h.palm.y,h.hs*0.45,0,6.283);ctx.stroke();
+    ctx.fillStyle=h.pinch?'#7dff9b':'rgba(255,255,255,.8)';ctx.beginPath();ctx.arc(h.pp.x,h.pp.y,6,0,6.283);ctx.fill();
+  }
+  if(G.flash>0){ctx.fillStyle=`rgba(255,40,40,${G.flash*0.45})`;ctx.fillRect(0,0,W,H)}
+  // score
+  ctx.save();ctx.textAlign='center';ctx.shadowColor='#000';ctx.shadowBlur=8;ctx.fillStyle='#fff';ctx.font='800 46px system-ui';ctx.fillText(G.score,W/2,58);
+  ctx.font='600 12px system-ui';ctx.fillStyle='#cfe';ctx.fillText('BEST '+Math.max(best,G.score),W/2,78);
+  if(now<G.msgT){ctx.font='700 17px system-ui';ctx.fillStyle='#fff';ctx.fillText(G.msg,W/2,H*0.30)}
+  ctx.restore();
+}
+
+function loop(now){
+  const dt=Math.min(0.033,(now-last)/1000||0.016);last=now;
+  if(mode==='cam'){fit=drawVideo()||fit;ctx.fillStyle='rgba(5,8,20,.28)';ctx.fillRect(0,0,W,H)}else wall();
+  if(G.state!=='menu'){
+    const hs=getHands(now);
+    if(mode==='cam'&&G.state!=='over'&&!hs.length&&G.state==='ready')hud.textContent='Show your hand to the camera';
+    else hud.textContent=G.state==='incoming'?'CATCH IT!':G.state==='ready'||G.state==='held'?'Pinch the ball, then open your fingers to throw':'';
+    if(G.state!=='over')update(now,dt,hs);else{for(const p of parts){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=500*dt;p.l-=dt*1.8}parts=parts.filter(p=>p.l>0);G.flash=Math.max(0,G.flash-dt*1.2)}
+    draw(now,hs);
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---------- touch mode ----------
+function startTouch(){
+  initAudio();mode='touch';menu.style.display='none';tagEl.style.display='block';tagEl.textContent='Touch mode';
+  cv.onpointerdown=e=>{ptr={x:e.clientX,y:e.clientY,down:true};cv.setPointerCapture(e.pointerId)};
+  cv.onpointermove=e=>{if(ptr&&ptr.down){ptr.x=e.clientX;ptr.y=e.clientY}};
+  cv.onpointerup=cv.onpointercancel=()=>{if(ptr)ptr.down=false};
+  resetGame();
+}
+
+// ---------- camera + hand tracking ----------
+const BASE='https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/';
+const loadScript=src=>new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('script'));document.head.appendChild(s)});
+const withTimeout=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+async function startCam(){
+  initAudio();
+  const btn=document.getElementById('go'),msg=menu.querySelector('p');btn.textContent='Starting…';btn.disabled=true;
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:960},height:{ideal:720}},audio:false});
+    vid.srcObject=stream;await vid.play();
+    mode='cam';menu.style.display='none';hud.textContent='Loading hand tracker…';G.state='loading';
+    await withTimeout(loadScript(BASE+'hands.js'),8000);
+    const hands=new Hands({locateFile:f=>BASE+f});
+    hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.6,minTrackingConfidence:0.5});
+    hands.onResults(r=>{
+      if(!fit)return;
+      const list=(r.multiHandLandmarks||[]).map(l=>l.map(p=>({x:W-(p.x*fit.dw+fit.ox),y:p.y*fit.dh+fit.oy})));
+      list.sort((a,b)=>a[0].x-b[0].x);mpHands=list;mpTime=performance.now();
+    });
+    await withTimeout(hands.initialize(),15000);
+    tagEl.style.display='block';tagEl.textContent='Hand tracking on';
+    resetGame();
+    let busy=false;
+    const pump=async()=>{if(!busy&&vid.readyState>=2){busy=true;try{await hands.send({image:vid})}catch(e){}busy=false}requestAnimationFrame(pump)};
+    pump();
+  }catch(err){
+    mode='none';G.state='menu';menu.style.display='flex';btn.disabled=false;btn.textContent='Retry camera';
+    if(vid.srcObject)vid.srcObject.getTracks().forEach(t=>t.stop());
+    msg.textContent=(!navigator.mediaDevices)?'This page isn’t allowed to use the camera here. Host it on HTTPS (e.g. GitHub Pages), or play with touch.':(err&&err.name==='NotAllowedError')?'Camera access was blocked. Allow the camera for this site and retry, or play with touch.':'Couldn’t start hand tracking ('+((err&&err.name)||(err&&err.message)||'error')+'). It needs internet and a normal HTTPS page. You can still play with touch.';
+  }
+}
+document.getElementById('go').onclick=startCam;
+document.getElementById('touch').onclick=startTouch;
+document.getElementById('again').onclick=()=>{initAudio();resetGame()};
+</script>
+</body>
+</html>
